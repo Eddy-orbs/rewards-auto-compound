@@ -1,4 +1,8 @@
-cd /home/orbsian/git/eddy-orbs/rewards-auto-compound/
+#!/usr/bin/env bash
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR" || exit 1
+
 set -o pipefail
 
 DATE=$(date +"%Y%m%d")
