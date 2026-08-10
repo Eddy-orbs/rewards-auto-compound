@@ -1,4 +1,4 @@
-import {getDelegators, getGuardians} from "@orbs-network/pos-analytics-lib";
+import {getGuardians} from "@orbs-network/pos-analytics-lib";
 import {getActiveEndpointName, getWeb3, hasAlternateWeb3, setSingleWeb3, switchToAlternateWeb3} from './web3Singleton'
 import {stakingRewardsAbi} from './abi'
 import {constants} from "./constants";
@@ -10,6 +10,9 @@ import BigNumber from 'bignumber.js';
 const EthereumMulticall = require('@orbs-network/ethereum-multicall');
 const MULTICALL3_POLYGON_ADDRESS = '0xcA11bde05977b3631167028862bE2a173976CA11';
 const RETRY_DELAY_MS = 5000;
+const SUBGRAPH_BATCH_SIZE = 50;
+const SUBGRAPH_PAGE_SIZE = 1000;
+const POLYGON_SUBGRAPH_URL = 'https://hub.orbs.network/posAnalyticsSubgraphPol';
 
 function sleep(ms: number) {
     return new Promise(resolve => setTimeout(resolve, ms));
@@ -85,20 +88,116 @@ async function CalcAndSendMetrics(numberOfWallets, totalCompounded) {
     console.log(response)
 }
 
+async function queryPolygonSubgraph(query: string) {
+    const response = await fetch(POLYGON_SUBGRAPH_URL, {
+        method: 'post',
+        body: JSON.stringify({query}),
+        headers: {'Content-Type': 'application/json'}
+    });
+    if (!response.ok) {
+        throw new Error(`Polygon subgraph HTTP error: ${response.status} ${response.statusText}`);
+    }
+
+    const payload: any = await response.json();
+    if (payload.errors) {
+        throw new Error(`Polygon subgraph query failed: ${JSON.stringify(payload.errors)}`);
+    }
+    return payload.data;
+}
+
+function splitIntoBatches<T>(items: T[], batchSize: number): T[][] {
+    const batches: T[][] = [];
+    for (let i = 0; i < items.length; i += batchSize) {
+        batches.push(items.slice(i, i + batchSize));
+    }
+    return batches;
+}
+
+async function getDelegatorCandidates(guardianAddresses: string[]) {
+    const candidates: Array<{guardian: string, delegator: string}> = [];
+    const seen = new Set<string>();
+
+    for (let guardianIndex = 0; guardianIndex < guardianAddresses.length; guardianIndex++) {
+        const guardian = guardianAddresses[guardianIndex];
+        let cursor: string | undefined;
+        let pageNumber = 0;
+        let guardianCandidates = 0;
+
+        while (true) {
+            const cursorFilter = cursor ? `, id_gt: "${cursor}"` : '';
+            const data = await queryPolygonSubgraph(`{
+                delegateds(
+                    first: ${SUBGRAPH_PAGE_SIZE},
+                    orderBy: id,
+                    orderDirection: asc,
+                    where: {to: "${guardian}"${cursorFilter}}
+                ) { id from }
+            }`);
+            const delegations: Array<{id: string, from: string}> = data.delegateds;
+            if (!Array.isArray(delegations)) {
+                throw new Error(`Polygon subgraph returned invalid delegateds data for ${guardian}`);
+            }
+
+            for (const delegation of delegations) {
+                const delegator = delegation.from.toLowerCase();
+                const key = `${guardian}:${delegator}`;
+                if (delegator !== guardian && !seen.has(key)) {
+                    seen.add(key);
+                    candidates.push({guardian, delegator});
+                    guardianCandidates += 1;
+                }
+            }
+
+            pageNumber += 1;
+            if (delegations.length < SUBGRAPH_PAGE_SIZE) break;
+
+            const nextCursor = delegations[delegations.length - 1]?.id;
+            if (!nextCursor || nextCursor === cursor) {
+                throw new Error(`Polygon subgraph pagination cursor did not advance for ${guardian}`);
+            }
+            cursor = nextCursor;
+        }
+        console.log(`Loaded ${guardianCandidates} candidates for guardian ${guardianIndex + 1}/${guardianAddresses.length} in ${pageNumber} page(s)`);
+    }
+    return candidates;
+}
+
+async function getActiveDelegators(candidates: Array<{guardian: string, delegator: string}>) {
+    const activeDelegators: string[] = [];
+    const candidateBatches = splitIntoBatches(candidates, SUBGRAPH_BATCH_SIZE);
+
+    for (let batchIndex = 0; batchIndex < candidateBatches.length; batchIndex++) {
+        const batch = candidateBatches[batchIndex];
+        const fields = batch.map(({guardian, delegator}, index) =>
+            `d${index}: delegatedStakeChangeds(first: 1, where: {addr: "${guardian}", delegator: "${delegator}"}, orderBy: blockNumber, orderDirection: desc) { delegatorContributedStake }`
+        ).join('\n');
+        const data = await queryPolygonSubgraph(`{ ${fields} }`);
+
+        batch.forEach(({delegator}, index) => {
+            const rawStake = data[`d${index}`]?.[0]?.delegatorContributedStake;
+            if (rawStake !== undefined && bigToNumber(new BigNumber(rawStake)) > constants.compoundRewardsThreshold) {
+                activeDelegators.push(delegator);
+            }
+        });
+        console.log(`Checked delegator stake batch ${batchIndex + 1}/${candidateBatches.length}`);
+    }
+    return activeDelegators;
+}
+
 async function getDelegatorsList() {
     console.log("Getting a list of stakers...")
-    let stakers: string[] = [];
-    const allGuardians = await getGuardians(constants.nodeEndpoints)
-    for (const guardian of allGuardians) {
-        console.log(`Working on guardian ${guardian.address}`)
-        const g_info = await withRpcFallback(`get delegators for ${guardian.address}`, async () => {
-            return await getDelegators(guardian.address, getWeb3());
-        });
-        stakers.push(guardian.address);
-        for (const d of g_info) {
-            if (d.stake > constants.compoundRewardsThreshold) stakers.push(d.address);
-        }
+    const metaData = await queryPolygonSubgraph(`{ _meta { block { number } hasIndexingErrors } }`);
+    const indexedBlock = Number(metaData?._meta?.block?.number);
+    if (metaData?._meta?.hasIndexingErrors !== false || !Number.isSafeInteger(indexedBlock)) {
+        throw new Error(`Polygon subgraph metadata is invalid: ${JSON.stringify(metaData?._meta)}`);
     }
+    console.log(`Polygon subgraph is healthy at block ${indexedBlock}`);
+    const allGuardians = await getGuardians(constants.nodeEndpoints)
+    const guardianAddresses = allGuardians.map(guardian => guardian.address.toLowerCase());
+    const candidates = await getDelegatorCandidates(guardianAddresses);
+    console.log(`Found ${candidates.length} guardian/delegator candidates; checking current stake in batches of ${SUBGRAPH_BATCH_SIZE}`)
+    const activeDelegators = await getActiveDelegators(candidates);
+    const stakers = Array.from(new Set([...guardianAddresses, ...activeDelegators]));
     console.log(`Found ${stakers.length} stakers`)
     return stakers;
 }

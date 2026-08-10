@@ -11,7 +11,11 @@ let activeEndpointName = 'primary';
 
 async function createWeb3(endpoint: string, endpointName: string) {
     if (!endpoint) throw new Error(`${endpointName} RPC endpoint is not configured`);
-    web3Singleton = await getWeb3Polygon(endpoint);
+    // This service only uses direct contract calls and does not need the PoS
+    // library's historical contract discovery. Enabling it scans the Polygon
+    // registry from its deployment block in one eth_getLogs request, which is
+    // rejected by RPC providers that enforce a 10,000-block range limit.
+    web3Singleton = await getWeb3Polygon(endpoint, false);
     web3Singleton.eth.transactionPollingTimeout = 750;
     web3Singleton.eth.transactionBlockTimeout = 50;
     web3Singleton.eth.transactionConfirmationBlocks = 24;
